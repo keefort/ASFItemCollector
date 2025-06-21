@@ -52,20 +52,24 @@ public sealed class ASFItemCollectorPlugin : IPlugin, IASF, IBotSteamClient, IBo
 		return Task.CompletedTask;
 	}
 
-	public Task OnBotSteamCallbacksInit(Bot bot, CallbackManager callbackManager)
-	{
-		return Task.CompletedTask;
-	}
-
 	public Task<IReadOnlyCollection<ClientMsgHandler>?> OnBotSteamHandlersInit(Bot bot)
 	{
 		ArgumentNullException.ThrowIfNull(bot);
 
-		ItemDropHandler itemDropHandler = new(_config!, bot.ArchiLogger);
+		ItemDropHandler itemDropHandler = new(bot, _config!);
 		_itemDropHandlers.TryAdd(bot, itemDropHandler);
 
 		IReadOnlyCollection<ClientMsgHandler> result = [itemDropHandler];
 		return Task.FromResult<IReadOnlyCollection<ClientMsgHandler>?>(result);
+	}
+
+	public Task OnBotSteamCallbacksInit(Bot bot, CallbackManager callbackManager)
+	{
+		ArgumentNullException.ThrowIfNull(bot);
+
+		bot.GetHandler<ItemDropHandler>()?.SetupCallbacks(callbackManager);
+
+		return Task.CompletedTask;
 	}
 
 	public Task OnBotLoggedOn(Bot bot)
