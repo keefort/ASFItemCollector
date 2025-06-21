@@ -3,17 +3,17 @@ using System.Text.Json.Serialization;
 namespace ASFItemCollector.Data.Plugin;
 
 [method: JsonConstructor]
-public sealed class App(uint appId, string name, IReadOnlyCollection<uint> items)
+public sealed class App(uint id, string name, IReadOnlyCollection<uint> itemDefIds)
 {
 	[JsonInclude]
-	[JsonPropertyName("AppId")]
-	public uint AppId { get; private set; } = appId;
+	[JsonPropertyName("ID")]
+	public uint ID { get; private set; } = id;
 
 	[JsonInclude]
 	[JsonPropertyName("Name")]
 	public string? Name { get; private set; } = name;
 
 	[JsonInclude]
-	[JsonPropertyName("Items")]
-	public IReadOnlyCollection<uint> Items { get; private set; } = items ?? throw new ArgumentNullException(nameof(items));
+	[JsonPropertyName("ItemDefIds")]
+	public IReadOnlyCollection<uint> ItemDefIds { get; private set; } = itemDefIds ?? throw new ArgumentNullException(nameof(itemDefIds));
 }

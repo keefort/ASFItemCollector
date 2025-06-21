@@ -1,8 +1,10 @@
 using System.Text.Json;
+using System.Threading.Tasks;
 using System.Timers;
 
 using ArchiSteamFarm.Core;
 using ArchiSteamFarm.NLog;
+using ArchiSteamFarm.Steam;
 
 using ASFItemCollector.Data;
 using ASFItemCollector.Data.Plugin;
@@ -12,10 +14,14 @@ using SteamKit2.Internal;
 
 namespace ASFItemCollector.Handlers;
 
-public sealed class ItemDropHandler(PluginConfig config, ArchiLogger logger) : ClientMsgHandler, IDisposable
+public sealed class ItemDropHandler(Bot bot, PluginConfig config) : ClientMsgHandler, IDisposable
 {
+#pragma warning disable CA2213
+	private readonly Bot _bot = bot ?? throw new ArgumentNullException(nameof(bot));
+#pragma warning restore CA2213
 	private readonly PluginConfig _config = config ?? throw new ArgumentNullException(nameof(config));
-	private readonly ArchiLogger _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+
+	private readonly ArchiLogger _logger = bot.ArchiLogger;
 
 	private System.Timers.Timer? _dropCheckTimer;
 
@@ -28,20 +34,39 @@ public sealed class ItemDropHandler(PluginConfig config, ArchiLogger logger) : C
 	{
 		if (_dropCheckTimer is not null)
 		{
-			_dropCheckTimer.Elapsed -= TimerCallback;
+			_dropCheckTimer.Elapsed -= CheckItemDrops;
 			_dropCheckTimer.Dispose();
 		}
 	}
 
 	public override void HandleMsg(IPacketMsg packetMsg)
 	{
-		if (packetMsg is null)
-			ASF.ArchiLogger.LogNullError(nameof(packetMsg));
+		if (packetMsg is null) return;
+		switch (packetMsg.MsgType)
+		{
+			default:
+				break;
+		}
 	}
 
-	private async void TimerCallback(object? state, ElapsedEventArgs e)
+	public void SetupCallbacks(CallbackManager manager)
 	{
-		_logger.LogGenericDebug("Timer callback started execution");
+		ArgumentNullException.ThrowIfNull(manager);
+
+		_ = manager.Subscribe<SteamUser.PlayingSessionStateCallback>(OnPlayingSessionState);
+	}
+
+	public void OnPlayingSessionState(SteamUser.PlayingSessionStateCallback callback)
+	{
+		if (_config!.Enabled && !IsRunning && _bot.CardsFarmer.Paused && _bot.IsPlayingPossible)
+			Utilities.InBackground(StartIdling);
+		else if (IsRunning && !_bot.IsPlayingPossible)
+			Utilities.InBackground(StopIdling);
+	}
+
+	private async void CheckItemDrops(object? state, ElapsedEventArgs e)
+	{
+		_logger.LogGenericDebug("Item drop check started");
 
 		try
 		{
@@ -49,18 +74,23 @@ public sealed class ItemDropHandler(PluginConfig config, ArchiLogger logger) : C
 
 			var uncheckedItems = new List<uint>();
 			foreach (var app in _config.Apps)
-				foreach (var item in app.Items)
+				foreach (var itemDefId in app.ItemDefIds)
 				{
-					var drop = await CheckItemDrop(app.AppId, item).ConfigureAwait(false);
+					var drop = await GetItemDrop(app.ID, itemDefId).ConfigureAwait(false);
 
 					if (drop is not null)
 					{
-						uncheckedItems = [.. app.Items.SkipWhile(x => x != item).Skip(1)];
+						_logger.LogGenericInfo($"Received item for appid {app.ID}: {drop.ItemDefId}");
 
+						uncheckedItems = [.. app.ItemDefIds.SkipWhile(x => x != itemDefId).Skip(1)];
 						if (uncheckedItems.Count != 0)
-							_logger.LogGenericDebug($"Skipped itemdefids for appid {app.AppId}: {string.Join(", ", uncheckedItems)}");
+							_logger.LogGenericDebug($"Skipped itemdefids for appid {app.ID}: {string.Join(", ", uncheckedItems)}");
 
 						break;
+					}
+					else
+					{
+						_logger.LogGenericDebug($"Received empty drop for itemdefid {itemDefId} of appid {app.ID}");
 					}
 
 					_logger.LogGenericDebug("Wait 5 seconds before next request");
@@ -69,19 +99,21 @@ public sealed class ItemDropHandler(PluginConfig config, ArchiLogger logger) : C
 		}
 		catch (Exception ex)
 		{
-			_logger.LogGenericException(ex, "Failed to execute timer callback");
+			_logger.LogGenericException(ex, "Failed to check item drop");
 		}
-
 		finally
 		{
-			_logger.LogGenericDebug("Timer callback finished execution");
+			_logger.LogGenericDebug("Item drop check complete");
 		}
 	}
 
 	public async Task StartIdling()
 	{
 		if (IsRunning)
-			throw new InvalidOperationException("Item drop collection is already active");
+			throw new InvalidOperationException("dropped item collection is already active");
+
+		if (!_bot.IsPlayingPossible || _bot.CardsFarmer.NowFarming)
+			throw new InvalidOperationException("unable to start collecting dropped items");
 
 		if (_dropCheckTimer is null)
 		{
@@ -90,32 +122,33 @@ public sealed class ItemDropHandler(PluginConfig config, ArchiLogger logger) : C
 				AutoReset = true
 			};
 
-			_dropCheckTimer.Elapsed += TimerCallback;
+			_dropCheckTimer.Elapsed += CheckItemDrops;
 		}
 
 		_dropCheckTimer.Start();
 
 		await SetPlayingStatus().ConfigureAwait(false);
+
+		_bot.ArchiLogger.LogGenericInfo("Dropped item collection started");
 	}
 
 	public async Task StopIdling()
 	{
 		if (!IsRunning)
-			throw new InvalidOperationException("Item drop collection is not active");
+			throw new InvalidOperationException("dropped item collection is not active");
 
 		_dropCheckTimer?.Stop();
 
-		await ClearPlayingStatus().ConfigureAwait(false);
+		if (_bot.IsConnectedAndLoggedOn)
+			await ClearPlayingStatus().ConfigureAwait(false);
+
+		_bot.ArchiLogger.LogGenericInfo("Dropped item collection stopped");
 	}
 
 	public async Task SetPlayingStatus()
 	{
 		if (!Client.IsConnected)
-		{
-			_logger.LogGenericWarning("Cannot set playing status: client not connected");
-
-			return;
-		}
+			throw new InvalidOperationException("client is not connected");
 
 		var response = new ClientMsgProtobuf<CMsgClientGamesPlayed>(EMsg.ClientGamesPlayed);
 
@@ -124,7 +157,7 @@ public sealed class ItemDropHandler(PluginConfig config, ArchiLogger logger) : C
 			response.Body.games_played.Add(new CMsgClientGamesPlayed.GamePlayed
 			{
 				steam_id_gs = Client.SteamID!,
-				game_id = new GameID(app.AppId),
+				game_id = new GameID(app.ID),
 			});
 		}
 
@@ -136,11 +169,7 @@ public sealed class ItemDropHandler(PluginConfig config, ArchiLogger logger) : C
 	public async Task ClearPlayingStatus()
 	{
 		if (!Client.IsConnected)
-		{
-			_logger.LogGenericWarning("Cannot clear playing status: client not connected");
-
-			return;
-		}
+			throw new InvalidOperationException("client is not connected");
 
 		var response = new ClientMsgProtobuf<CMsgClientGamesPlayed>(EMsg.ClientGamesPlayed);
 
@@ -149,17 +178,13 @@ public sealed class ItemDropHandler(PluginConfig config, ArchiLogger logger) : C
 		Client.Send(response);
 	}
 
-	public async Task<DropResult?> CheckItemDrop(uint appId, uint itemDefId)
+	public async Task<DropResult?> GetItemDrop(uint appId, uint itemDefId)
 	{
+		if (!Client.IsConnected)
+			throw new InvalidOperationException("client is not connected");
+
 		try
 		{
-			if (!Client.IsConnected)
-			{
-				_logger.LogGenericWarning("Cannot check item drop: client not connected");
-
-				return null;
-			}
-
 			_steamUnifiedMessages ??= Client.GetHandler<SteamUnifiedMessages>();
 			_inventoryService ??= _steamUnifiedMessages?.CreateService<Inventory>();
 
@@ -179,18 +204,7 @@ public sealed class ItemDropHandler(PluginConfig config, ArchiLogger logger) : C
 			_logger.LogGenericDebug($"Response received for appid {appId}: {json}");
 
 			var drops = JsonSerializer.Deserialize<DropResult[]>(json);
-			var drop = drops?.FirstOrDefault(d => !string.IsNullOrEmpty(d.ItemDefId));
-
-			if (drop is null)
-			{
-				_logger.LogGenericDebug($"Received empty drop for itemdefid {itemDefId} of appid {appId}");
-
-				return null;
-			}
-
-			_logger.LogGenericInfo($"Received item for appid {appId}: {drop.ItemDefId}");
-
-			return drop;
+			return drops?.FirstOrDefault(d => !string.IsNullOrEmpty(d.ItemDefId));
 		}
 		catch (Exception ex)
 		{
